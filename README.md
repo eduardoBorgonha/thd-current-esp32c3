@@ -1,4 +1,4 @@
-# ESP32-C3 Current & THD-i Analyzer
+# ESP32-C3 Current THD Analyzer
 
 ## About
 
