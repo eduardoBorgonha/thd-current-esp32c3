@@ -96,7 +96,7 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 
 #vscode:
-vscode/
+.vscode/
 
 #devcontainer:
-devcontainer/
+.devcontainer/

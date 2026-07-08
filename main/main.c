@@ -1,15 +1,17 @@
 /*
-  EEL7030 - Microprocessadores
-  Projeto: Calculadora de Grandezas Elétricas - ESP32-C3
+  EEL7035 - Microprocessors e & Microcontrollers 
+  Universidade Federal de Santa Catarina (UFSC)
+  Project: Current Quantities Calculator - ESP32-C3
+  Authors: Eduardo and Mateus
   
-  Descrição: 
-  Firmware para aquisição e processamento digital de sinais de corrente elétrica.
-  Implementa um sistema de tempo real (FreeRTOS) para amostragem determinística
-  (Timer via Interrupção), cálculo de Componente DC, Valor RMS (True RMS) e 
-  análise espectral via Transformada Rápida de Fourier (FFT Radix-2) para 
-  cálculo da Distorção Harmônica Total (THD).
+  Description: 
+  Firmware for the acquisition and digital processing of electrical current signals.
+  Implements a real-time system using FreeRTOS for deterministic sampling
+  (Hardware Timer via Interrupt), calculation of the DC Component, True RMS value, and 
+  spectral analysis via Fast Fourier Transform (Cooley-Tukey Radix-2 FFT) to 
+  compute the Total Harmonic Distortion of Current (THD-i).
   
-  Interface: Display LCD 16x2 via protocolo I2C e LEDs de sinalização de estado.
+  Interface: 16x2 LCD Display via I2C protocol and status indicator LEDs.
 */
 
 #include <stdio.h>
@@ -30,81 +32,81 @@
 #include "esp_task_wdt.h"
 
 // ============================================================================
-// DEFINIÇÕES DE HARDWARE E PINAGEM
+// HARDWARE DEFINITIONS AND PINOUT
 // ============================================================================
-#define BOTAO_PIN 10
-#define LED_HEARTBEAT_PIN 8      // Sinalização de atividade do RTOS
-#define LED_ALERTA_PIN 3         // Alerta visual de alta distorção harmônica
+#define BUTTON_PIN 10
+#define LED_HEARTBEAT_PIN 8      // RTOS activity signaling
+#define LED_ALERT_PIN 3          // Visual alert for high harmonic distortion
 
-#define TEMPO_DEBOUNCE_US 250000 // 250 ms de tolerância mecânica para o botão
+#define DEBOUNCE_TIME_US 250000  // 250 ms mechanical tolerance for the push-button
 
 #define I2C_SDA_PIN 4
 #define I2C_SCL_PIN 5
-#define LCD_ENDERECO 0x27        // Endereço padrão do expansor PCF8574 (I2C)
+#define LCD_ADDRESS 0x27         // Default address for the PCF8574 I2C expander
 
-#define ADC_PINO_CANAL ADC_CHANNEL_0 // Relativo ao GPIO 0 no ESP32-C3
+#define ADC_CHANNEL_PIN ADC_CHANNEL_0 // Relative to GPIO 0 on ESP32-C3
 
 // ============================================================================
-// PARÂMETROS DE AQUISIÇÃO E INSTRUMENTAÇÃO
+// ACQUISITION AND INSTRUMENTATION PARAMETERS
 // ============================================================================
-#define N_AMOSTRAS 512           // Janela temporal: 4 ciclos da rede (60 Hz)
-#define ACS712_SENSIBILIDADE_V_POR_A 0.185f // Fator de sensibilidade do ACS712 (185mV/A)
+#define NUM_SAMPLES 512          // Time window: 4 full grid cycles (60 Hz)
+#define ACS712_SENSITIVITY_V_PER_A 0.185f // ACS712 sensitivity factor (185mV/A)
 
-// Condicionamento de Sinal:
-#define FATOR_DIVISOR_TENSAO 1.551f   // Atenuação resistiva de proteção do ADC
-#define OFFSET_TENSAO_PINO_ZERO 1.85f // Calibração empírica do ponto de 0A
+// Signal Conditioning:
+#define VOLTAGE_DIVIDER_FACTOR 1.551f   // Resistive attenuation to protect the ADC
+#define ZERO_A_PIN_VOLTAGE_OFFSET 1.85f // Empirical calibration for the 0A point
 
-#define THD_LIMITE_ALERTA_PCT 20.0f   // Limite percentual para acionamento do led
+#define THD_ALERT_LIMIT_PCT 20.0f       // Percentage threshold to trigger the alert LED
 
 #define PI 3.14159265358979323846
 
 // ============================================================================
-// VARIÁVEIS GLOBAIS E RECURSOS COMPARTILHADOS
+// GLOBAL VARIABLES AND SHARED RESOURCES
 // ============================================================================
-volatile uint8_t flag_tela = 0; // Qualificador 'volatile' previne otimização na ISR
+volatile uint8_t screen_flag = 0; // 'volatile' prevents compiler optimization in the ISR
 i2c_master_dev_handle_t lcd_handle;
 
-// Memória de Transição (Protegida por Semáforos)
-static int raw_adc[N_AMOSTRAS];
+// Transition Memory (Protected by Semaphores)
+static int raw_adc[NUM_SAMPLES];
 
-// Resultados Matemáticos Consolidados
-static float dc_resultado = 0.0f;
-static float rms_resultado = 0.0f;
-static float thd_resultado = 0.0f;
-static int freq_harmonica_sig = 0;
-static float amp_harmonica_sig = 0.0f;
+// Consolidated Mathematical Results
+static float dc_result = 0.0f;
+static float rms_result = 0.0f;
+static float thd_result = 0.0f;
+static int sig_harmonic_freq = 0;
+static float sig_harmonic_amp = 0.0f;
 
-// Handles de Drivers do ESP-IDF
+// ESP-IDF Driver Handles
 gptimer_handle_t timer_handle;
 adc_oneshot_unit_handle_t adc_handle;
-TaskHandle_t handle_amostragem;
+TaskHandle_t sampling_handle;
 
-// Semáforos binários para controle de fluxo sequencial e exclusão mútua (Token Ring)
-SemaphoreHandle_t sem_processamento;
-SemaphoreHandle_t sem_exibicao;
-SemaphoreHandle_t sem_inicio_ciclo;
+// Binary semaphores for sequential flow control and mutual exclusion (Token Ring pattern)
+SemaphoreHandle_t sem_processing;
+SemaphoreHandle_t sem_display;
+SemaphoreHandle_t sem_cycle_start;
 
 // ============================================================================
-// PROCESSAMENTO DIGITAL DE SINAIS (DSP)
+// DIGITAL SIGNAL PROCESSING (DSP)
 // ============================================================================
 
-// Função auxiliar para ordenação dos vetores
+// Helper function to swap array elements
 void swap(float *a, float *b) {
     float temp = *a;
     *a = *b;
     *b = temp;
 }
 
-// Implementação in-place da Transformada Rápida de Fourier (Cooley-Tukey Radix-2)
-// Otimizada em C nativo para adequação à arquitetura RISC-V sem FPU de hardware.
-void calcular_fft(float *vReal, float *vImag, uint16_t amostras) {
+// In-place Fast Fourier Transform (Cooley-Tukey Radix-2)
+// Optimized in native C to suit the RISC-V architecture without hardware FPU.
+void calculate_fft(float *vReal, float *vImag, uint16_t samples) {
     uint16_t i, j, k, n1, n2, a;
     float c, s, t1, t2;
 
-    // Etapa 1: Reordenação Bit-Reversal
+    // Step 1: Bit-Reversal Reordering
     j = 0;
-    n2 = amostras / 2;
-    for (i = 1; i < amostras - 1; i++) {
+    n2 = samples / 2;
+    for (i = 1; i < samples - 1; i++) {
         n1 = n2;
         while (j >= n1) { j = j - n1; n1 = n1 / 2; }
         j = j + n1;
@@ -114,18 +116,18 @@ void calcular_fft(float *vReal, float *vImag, uint16_t amostras) {
         }
     }
 
-    // Etapa 2: Borboletas (Butterfly Computation)
+    // Step 2: Butterfly Computation
     n1 = 0;
     n2 = 1;
-    for (i = 0; i < 9; i++) { // log2(512) = 9 estágios
+    for (i = 0; i < 9; i++) { // log2(512) = 9 stages
         n1 = n2;
         n2 = n2 + n2;
         a = 0;
         for (j = 0; j < n1; j++) {
-            c = cosf(-2.0f * PI * a / amostras);
-            s = sinf(-2.0f * PI * a / amostras);
+            c = cosf(-2.0f * PI * a / samples);
+            s = sinf(-2.0f * PI * a / samples);
             a += 1 << (9 - i - 1);
-            for (k = j; k < amostras; k = k + n2) {
+            for (k = j; k < samples; k = k + n2) {
                 t1 = c * vReal[k + n1] - s * vImag[k + n1];
                 t2 = s * vReal[k + n1] + c * vImag[k + n1];
                 vReal[k + n1] = vReal[k] - t1;
@@ -138,69 +140,69 @@ void calcular_fft(float *vReal, float *vImag, uint16_t amostras) {
 }
 
 // ============================================================================
-// ROTINAS DE SERVIÇO DE INTERRUPÇÃO (ISRs)
+// INTERRUPT SERVICE ROUTINES (ISRs)
 // ============================================================================
 
-// Interrupção externa (Botão). Implementa Debounce Lógico via Software.
-static void IRAM_ATTR gpio_isr_botao(void *arg) {
-    static uint64_t ultimo_tempo_isr = 0;
-    uint64_t tempo_atual = esp_timer_get_time();
-    // Rejeita transientes (bouncing) inferiores a 250ms
-    if ((tempo_atual - ultimo_tempo_isr) > TEMPO_DEBOUNCE_US) {
-        flag_tela = !flag_tela;
-        ultimo_tempo_isr = tempo_atual;
+// External interrupt (Button). Implements logical Debounce via Software.
+static void IRAM_ATTR gpio_isr_button(void *arg) {
+    static uint64_t last_isr_time = 0;
+    uint64_t current_time = esp_timer_get_time();
+    // Rejects mechanical bouncing under 250ms
+    if ((current_time - last_isr_time) > DEBOUNCE_TIME_US) {
+        screen_flag = !screen_flag;
+        last_isr_time = current_time;
     }
 }
 
-// Alarme do Temporizador (130 us). 
-// NOTA ARQUITETURAL: Não realiza a leitura do ADC internamente para evitar travamentos.
-// Emite uma notificação rápida para a *Task* de Amostragem assumir o contexto.
-static bool IRAM_ATTR callback_alarme(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-    BaseType_t acordou = pdFALSE;
-    vTaskNotifyGiveFromISR(handle_amostragem, &acordou);
-    portYIELD_FROM_ISR(acordou); // Solicita preempção imediata do Scheduler
+// Hardware Timer Alarm (130 us). 
+// ARCHITECTURAL NOTE: Does not read the ADC internally to avoid system crashes.
+// Emits a fast notification to the SAMPLING TASK to assume the context.
+static bool IRAM_ATTR alarm_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
+    BaseType_t awoken = pdFALSE;
+    vTaskNotifyGiveFromISR(sampling_handle, &awoken);
+    portYIELD_FROM_ISR(awoken); // Requests immediate preemption from the Scheduler
     return true;
 }
 
 // ============================================================================
-// DRIVER I2C E INTERFACE HOMEM-MÁQUINA (LCD)
+// I2C DRIVER AND HUMAN-MACHINE INTERFACE (LCD)
 // ============================================================================
 
-// Empacota e transmite instruções I2C para o expansor de 8-bits PCF8574
-// Respeita a multiplexação de 4-bits exigida pelo controlador HD44780
-void lcd_send(uint8_t valor, uint8_t modo) {
-    uint8_t nibble_alto = valor & 0xF0;
-    uint8_t nibble_baixo = (valor << 4) & 0xF0;
-    uint8_t dados[4];
-    uint8_t controle = modo | 0x08; // 0x08 garante o Backlight ligado
+// Packages and transmits I2C instructions to the 8-bit PCF8574 expander
+// Respects the 4-bit multiplexing required by the HD44780 controller
+void lcd_send(uint8_t value, uint8_t mode) {
+    uint8_t high_nibble = value & 0xF0; // Grabs the 4 most significant bits and clears the rest
+    uint8_t low_nibble = (value << 4) & 0xF0; // Pushes the 4 least significant bits to the left
+    uint8_t data[4];
+    uint8_t control = mode | 0x08; // 0x08 ensures the Backlight remains ON
     
-    // Geração do pulso de Enable (bit 0x04)
-    dados[0] = nibble_alto | controle | 0x04;
-    dados[1] = nibble_alto | controle;
-    dados[2] = nibble_baixo | controle | 0x04;
-    dados[3] = nibble_baixo | controle;
+    // Enable pulse generation (bit 0x04)
+    data[0] = high_nibble | control | 0x04;
+    data[1] = high_nibble | control;
+    data[2] = low_nibble | control | 0x04;
+    data[3] = low_nibble | control;
     
-    i2c_master_transmit(lcd_handle, dados, 4, -1);
-    usleep(2000); // Respeita tempo de latência do display
+    i2c_master_transmit(lcd_handle, data, 4, -1);
+    usleep(2000); // Respects the physical latency of the display
 }
 
-void lcd_cmd(uint8_t cmd)   { lcd_send(cmd, 0); } // Transmite Comando Lógico
-void lcd_data(uint8_t dado) { lcd_send(dado, 1); } // Transmite Caractere ASCII
+void lcd_cmd(uint8_t cmd)   { lcd_send(cmd, 0); } // Transmits Logic Command
+void lcd_data(uint8_t data) { lcd_send(data, 1); } // Transmits ASCII Character
 
-// Centraliza a escrita e preenche lacunas residuais para limpar o buffer da tela
-void lcd_escreve_linha(int linha, const char *str) {
-    if (linha == 0) lcd_cmd(0x80); else lcd_cmd(0xC0);
+// Centralizes the writing process and fills residual gaps to clear the screen buffer
+void lcd_write_line(int line, const char *str) {
+    if (line == 0) lcd_cmd(0x80); else lcd_cmd(0xC0);
     int i = 0;
     while (i < 16 && str[i] != '\0') { lcd_data(str[i]); i++; }
-    while (i < 16) { lcd_data(' '); i++; }
+    while (i < 16) { lcd_data(' '); i++; } // Fills the rest of the line with blank spaces avoiding the clear screen command
 }
 
 // ============================================================================
-// ROTINAS DE CONFIGURAÇÃO DE HARDWARE
+// HARDWARE CONFIGURATION ROUTINES
 // ============================================================================
 
-void configura_leds(void) {
-    uint64_t mask = (1ULL << LED_HEARTBEAT_PIN) | (1ULL << LED_ALERTA_PIN);
+void config_leds(void) {
+    uint64_t mask = (1ULL << LED_HEARTBEAT_PIN) | (1ULL << LED_ALERT_PIN);
     gpio_config_t io_conf = {
         .pin_bit_mask = mask,
         .mode = GPIO_MODE_OUTPUT,
@@ -210,281 +212,281 @@ void configura_leds(void) {
     };
     gpio_config(&io_conf);
     gpio_set_level(LED_HEARTBEAT_PIN, 0);
-    gpio_set_level(LED_ALERTA_PIN, 0);
+    gpio_set_level(LED_ALERT_PIN, 0);
 }
 
-void configura_botao(void) {
+void config_button(void) {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BOTAO_PIN),
+        .pin_bit_mask = (1ULL << BUTTON_PIN),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, // Pull-up interno ativado
+        .pull_up_en = GPIO_PULLUP_ENABLE, // Internal pull-up enabled
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE   // Interrupção na borda de descida
+        .intr_type = GPIO_INTR_NEGEDGE   // Interrupt on falling edge
     };
     gpio_config(&io_conf);
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-    gpio_isr_handler_add(BOTAO_PIN, gpio_isr_botao, NULL);
+    gpio_isr_handler_add(BUTTON_PIN, gpio_isr_button, NULL);
 }
 
-void configura_i2c_lcd(void) {
+void config_i2c_lcd(void) {
     i2c_master_bus_config_t i2c_bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = I2C_NUM_0,
         .scl_io_num = I2C_SCL_PIN,
         .sda_io_num = I2C_SDA_PIN,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+        .glitch_ignore_cnt = 7, // Noise filter
+        .flags.enable_internal_pullup = true, 
     };
     i2c_master_bus_handle_t bus_handle;
     i2c_new_master_bus(&i2c_bus_config, &bus_handle);
 
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = LCD_ENDERECO,
+        .device_address = LCD_ADDRESS,
         .scl_speed_hz = 100000,
     };
     i2c_master_bus_add_device(bus_handle, &dev_cfg, &lcd_handle);
 
     usleep(50000);
-    // Sequência mandatória de inicialização do controlador HD44780
+    // Mandatory initialization sequence for the HD44780 controller
     lcd_cmd(0x33); lcd_cmd(0x32); lcd_cmd(0x28); lcd_cmd(0x0C); lcd_cmd(0x01);
     usleep(50000);
 }
 
-void configura_adc(void) {
+void config_adc(void) {
     adc_oneshot_unit_init_cfg_t init_config = { .unit_id = ADC_UNIT_1 };
     adc_oneshot_new_unit(&init_config, &adc_handle);
     adc_oneshot_chan_cfg_t config = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12 // Permite leitura da escala total 0 ~ 3.3V
+        .atten = ADC_ATTEN_DB_12 // Allows reading the full 0 ~ 3.3V scale
     };
-    adc_oneshot_config_channel(adc_handle, ADC_PINO_CANAL, &config);
+    adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_PIN, &config);
 }
 
-void configura_timer(void) {
+void config_timer(void) {
     gptimer_config_t timer_config = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000 // Base temporal de 1 MHz (Tick = 1 us)
+        .resolution_hz = 1000000 // 1 MHz time base (Tick = 1 us)
     };
     gptimer_new_timer(&timer_config, &timer_handle);
 
     gptimer_alarm_config_t alarm_config = {
-        .alarm_count = 130,      // Taxa de Amostragem (Fs) = ~7680 Hz
+        .alarm_count = 130,      // Sampling Rate (Fs) = ~7680 Hz, Ts =~ 130us
         .reload_count = 0,
         .flags.auto_reload_on_alarm = true
     };
     gptimer_set_alarm_action(timer_handle, &alarm_config);
 
-    gptimer_event_callbacks_t cbs = { .on_alarm = callback_alarme };
+    gptimer_event_callbacks_t cbs = { .on_alarm = alarm_callback };
     gptimer_register_event_callbacks(timer_handle, &cbs, NULL);
 }
 
 // ============================================================================
-// TAREFAS DO SISTEMA (FREERTOS)
+// SYSTEM TASKS (FREERTOS)
 // ============================================================================
 
-// Tarefa de Prioridade Máxima: Gerencia exclusivamente as restrições de tempo real
-void vTarefaAmostragem(void *pvParameters) {
+// Highest Priority Task: Manages strict real-time constraints exclusively
+void vSamplingTask(void *pvParameters) {
     while (1) {
-        // Aguarda liberação do ciclo
-        xSemaphoreTake(sem_inicio_ciclo, portMAX_DELAY);
+        // Waits for cycle permission
+        xSemaphoreTake(sem_cycle_start, portMAX_DELAY);
         
         gptimer_enable(timer_handle);
         gptimer_start(timer_handle);
 
-        for (int i = 0; i < N_AMOSTRAS; i++) {
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Sincroniza com a ISR do Timer
-            adc_oneshot_read(adc_handle, ADC_PINO_CANAL, &raw_adc[i]);
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Synchronizes with the Timer ISR
+            adc_oneshot_read(adc_handle, ADC_CHANNEL_PIN, &raw_adc[i]);
         }
 
         gptimer_stop(timer_handle);
         gptimer_disable(timer_handle);
         
-        // Finaliza aquisição e autoriza início do processamento matemático
-        xSemaphoreGive(sem_processamento);
+        // Concludes acquisition and authorizes the start of mathematical processing
+        xSemaphoreGive(sem_processing);
     }
 }
 
-// Tarefa de Processamento (DSP): Executa todo o escopo matemático da aplicação
-void vTarefaProcessamento(void *pvParameters) {
-    // Alocação dinâmica mitigatória para prevenção de Stack Overflow 
-    // das matrizes necessárias à Transformada de Fourier
-    float *vReal = malloc(N_AMOSTRAS * sizeof(float));
-    float *vImag = malloc(N_AMOSTRAS * sizeof(float));
-    float corrente_array[N_AMOSTRAS]; 
+// Processing Task (DSP): Executes the entire mathematical scope of the application
+void vProcessingTask(void *pvParameters) {
+    // Mitigative dynamic allocation to prevent Stack Overflow 
+    // of the arrays required by the Fourier Transform
+    float *vReal = malloc(NUM_SAMPLES * sizeof(float));
+    float *vImag = malloc(NUM_SAMPLES * sizeof(float));
+    float current_array[NUM_SAMPLES]; 
 
     while (1) {
-        // Aguarda integridade do vetor de amostragem
-        xSemaphoreTake(sem_processamento, portMAX_DELAY);
+        // Waits for sampling array integrity
+        xSemaphoreTake(sem_processing, portMAX_DELAY);
 
-        float soma_corrente = 0.0f;
-        float soma_quadrados_true_rms = 0.0f;
+        float sum_current = 0.0f;
+        float sum_squares_true_rms = 0.0f;
 
-        // 1. CONDICIONAMENTO NO DOMÍNIO DO TEMPO
-        for (int i = 0; i < N_AMOSTRAS; i++) {
-            // Conversão da escala quantizada para grandeza analógica
-            float tensao_pino = ((float)raw_adc[i] / 4095.0f) * 3.3f;
+        // 1. TIME DOMAIN CONDITIONING
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            // Conversion from quantized scale to analog magnitude
+            float pin_voltage = ((float)raw_adc[i] / 4095.0f) * 3.3f;
             
-            // Subtração de Offset no domínio correto para anular erros de calibração
-            float tensao_pino_sem_dc = tensao_pino - OFFSET_TENSAO_PINO_ZERO;
+            // Offset subtraction in the correct domain to nullify calibration errors
+            float pin_voltage_no_dc = pin_voltage - ZERO_A_PIN_VOLTAGE_OFFSET;
             
-            // Projeção da tensão na entrada do divisor resistivo
-            float tensao_sensor_sem_dc = tensao_pino_sem_dc * FATOR_DIVISOR_TENSAO;
+            // Voltage projection at the input of the resistive divider
+            float sensor_voltage_no_dc = pin_voltage_no_dc * VOLTAGE_DIVIDER_FACTOR;
             
-            // Aplicação da lei característica do sensor ACS712
-            float amostra_corrente = tensao_sensor_sem_dc / ACS712_SENSIBILIDADE_V_POR_A;
+            // Application of the ACS712 sensor's characteristic law
+            float current_sample = sensor_voltage_no_dc / ACS712_SENSITIVITY_V_PER_A;
             
-            corrente_array[i] = amostra_corrente; 
-            soma_corrente += amostra_corrente;
-            soma_quadrados_true_rms += (amostra_corrente * amostra_corrente); 
+            current_array[i] = current_sample; 
+            sum_current += current_sample;
+            sum_squares_true_rms += (current_sample * current_sample); 
         }
 
-        // Extração da Componente Contínua (Nível DC)
-        dc_resultado = soma_corrente / N_AMOSTRAS;
+        // Direct Current Component Extraction (DC Level)
+        dc_result = sum_current / NUM_SAMPLES;
         
-        // Extração do Valor Eficaz Total (True RMS)
-        float rms_bruto = sqrtf(soma_quadrados_true_rms / N_AMOSTRAS);
+        // Total Effective Value Extraction (True RMS)
+        float raw_rms = sqrtf(sum_squares_true_rms / NUM_SAMPLES);
 
-        // Filtro de Zona Morta (Deadband): Zera correntes fantasmas derivadas de 
-        // acúmulo de variância do ruído branco de instrumentação
-        if (rms_bruto < 0.1f) {
-            dc_resultado = 0.0f;
-            rms_resultado = 0.0f;
+        // Deadband Filter: Zeroes out phantom currents derived from 
+        // instrumentation white noise variance accumulation
+        if (raw_rms < 0.1f) {
+            dc_result = 0.0f;
+            rms_result = 0.0f;
         } else {
-            rms_resultado = rms_bruto;
+            rms_result = raw_rms;
         }
 
-        // 2. CONDICIONAMENTO NO DOMÍNIO DA FREQUÊNCIA (FFT e THD)
-        // Evita execuções pesadas e divisão por zero quando a carga está inativa
-        if (rms_resultado > 0.1f) {
-            for (int i = 0; i < N_AMOSTRAS; i++) {
-                // Remoção do offset DC residual pré-FFT para evitar Vazamento Espectral (Spectral Leakage)
-                float ac_puro = corrente_array[i] - dc_resultado; 
+        // 2. FREQUENCY DOMAIN CONDITIONING (FFT and THD)
+        // Avoids heavy executions and division by zero when the load is inactive
+        if (rms_result > 0.1f) {
+            for (int i = 0; i < NUM_SAMPLES; i++) {
+                // Pre-FFT residual DC offset removal to prevent Spectral Leakage
+                float pure_ac = current_array[i] - dc_result; 
                 
-                // Aplicação da Janela de Hann (Mitigação de descontinuidades nas bordas da amostra)
-                float hann = 0.5f * (1.0f - cosf(2.0f * PI * i / (N_AMOSTRAS - 1.0f)));
-                vReal[i] = ac_puro * hann;
+                // Hann Window Application (Mitigation of discontinuities at sample edges)
+                float hann = 0.5f * (1.0f - cosf(2.0f * PI * i / (NUM_SAMPLES - 1.0f)));
+                vReal[i] = pure_ac * hann;
                 vImag[i] = 0.0f;
             }
 
-            calcular_fft(vReal, vImag, N_AMOSTRAS);
+            calculate_fft(vReal, vImag, NUM_SAMPLES);
 
-            // Resolução = Fs / N = 7680 / 512 = 15 Hz por Bin
-            float magnitude[65]; // Avaliação restrita aos 15 primeiros harmônicos (Bin 60 = 900 Hz)
+            // Resolution = Fs / N = 7680 / 512 = 15 Hz per Bin
+            float magnitude[65]; // Evaluation restricted to the first 15 harmonics (Bin 60 = 900 Hz)
             for(int i = 0; i <= 60; i++) {
                 magnitude[i] = sqrtf(vReal[i] * vReal[i] + vImag[i] * vImag[i]);
             }
 
-            // Mapeamento da Frequência Fundamental (60 Hz -> Bin 4)
+            // Fundamental Frequency Mapping (60 Hz -> Bin 4)
             float fundamental = magnitude[4];
             
-            float soma_harmonica_quadrados = 0.0f;
+            float sum_harmonic_squares = 0.0f;
             float max_harm_mag = 0.0f;
             int max_harm_h = 0;
 
-            // Extração de componentes harmônicos pares e ímpares (2º ao 15º)
+            // Extraction of even and odd harmonic components (2nd to 15th)
             if (fundamental > 0.001f) {
                 for (int h = 2; h <= 15; h++) {
                     int bin = h * 4;
                     float mag = magnitude[bin];
-                    soma_harmonica_quadrados += (mag * mag);
+                    sum_harmonic_squares += (mag * mag);
 
-                    // Captura do Harmônico mais ruidoso (Diagnóstico de Carga)
+                    // Capture of the noisiest Harmonic (Load Diagnostics)
                     if (mag > max_harm_mag) {
                         max_harm_mag = mag;
                         max_harm_h = h;
                     }
                 }
 
-                // Cálculo Final do Perfil de Distorção (THD)
-                float v_harmonica = sqrtf(soma_harmonica_quadrados);
-                thd_resultado = (v_harmonica / fundamental) * 100.0f;
-                amp_harmonica_sig = (max_harm_mag / fundamental) * 100.0f;
-                freq_harmonica_sig = max_harm_h * 60;
+                // Final Calculation of the Distortion Profile (THD)
+                float v_harmonic = sqrtf(sum_harmonic_squares);
+                thd_result = (v_harmonic / fundamental) * 100.0f;
+                sig_harmonic_amp = (max_harm_mag / fundamental) * 100.0f;
+                sig_harmonic_freq = max_harm_h * 60;
             } else {
-                thd_resultado = 0.0f;
-                amp_harmonica_sig = 0.0f;
-                freq_harmonica_sig = 0;
+                thd_result = 0.0f;
+                sig_harmonic_amp = 0.0f;
+                sig_harmonic_freq = 0;
             }
         } else {
-            // Garante inicialização segura de variáveis relativas à FFT em repouso
-            thd_resultado = 0.0f;
-            amp_harmonica_sig = 0.0f;
-            freq_harmonica_sig = 0;
+            // Ensures safe initialization of FFT-related variables at rest
+            thd_result = 0.0f;
+            sig_harmonic_amp = 0.0f;
+            sig_harmonic_freq = 0;
         }
 
-        // Autoriza atualização da Interface Gráfica
-        xSemaphoreGive(sem_exibicao);
+        // Authorizes Graphical Interface update
+        xSemaphoreGive(sem_display);
     }
 }
 
-// Tarefa de Prioridade Mínima: Executa formatações e interface I/O Lenta (I2C)
-void vTarefaExibicao(void *pvParameters) {
-    xSemaphoreGive(sem_inicio_ciclo); // Inicializa a cadeia de processamento
+// Lowest Priority Task: Executes formatting and slow I/O interface (I2C)
+void vDisplayTask(void *pvParameters) {
+    xSemaphoreGive(sem_cycle_start); // Initializes the processing chain
 
     while (1) {
-        xSemaphoreTake(sem_exibicao, portMAX_DELAY);
+        xSemaphoreTake(sem_display, portMAX_DELAY);
 
-        // Atualização Visual - Heartbeat prova a vivacidade do Scheduler (RTOS)
-        static uint8_t led_estado = 0;
-        led_estado = !led_estado;
-        gpio_set_level(LED_HEARTBEAT_PIN, led_estado);
+        // Visual Update - Heartbeat proves the Scheduler's (RTOS) vivacity
+        static uint8_t led_status = 0;
+        led_status = !led_status;
+        gpio_set_level(LED_HEARTBEAT_PIN, led_status);
 
-        // Lógica Atuadora Condicional (Alarme Físico)
-        if (thd_resultado >= THD_LIMITE_ALERTA_PCT) {
-            gpio_set_level(LED_ALERTA_PIN, 1); 
+        // Conditional Actuator Logic (Physical Alarm)
+        if (thd_result >= THD_ALERT_LIMIT_PCT) {
+            gpio_set_level(LED_ALERT_PIN, 1); 
         } else {
-            gpio_set_level(LED_ALERTA_PIN, 0); 
+            gpio_set_level(LED_ALERT_PIN, 0); 
         }
 
-        // Construção semântica e transmissão ao LCD 16x2
+        // Semantic construction and transmission to the 16x2 LCD
         char buffer[17];
-        if (flag_tela == 0) {
-            snprintf(buffer, sizeof(buffer), "Nivel DC: %4.2fA", dc_resultado);
-            lcd_escreve_linha(0, buffer);
+        if (screen_flag == 0) {
+            snprintf(buffer, sizeof(buffer), "DC Level: %4.2fA", dc_result);
+            lcd_write_line(0, buffer);
             
-            snprintf(buffer, sizeof(buffer), "RMS AC:   %4.2fA", rms_resultado);
-            lcd_escreve_linha(1, buffer);
+            snprintf(buffer, sizeof(buffer), "AC RMS:   %4.2fA", rms_result);
+            lcd_write_line(1, buffer);
         } else {
-            snprintf(buffer, sizeof(buffer), "THD: %5.1f %%", thd_resultado);
-            lcd_escreve_linha(0, buffer);
+            snprintf(buffer, sizeof(buffer), "THD: %5.1f %%", thd_result);
+            lcd_write_line(0, buffer);
             
-            snprintf(buffer, sizeof(buffer), "Max: %dHz %.1f%%", freq_harmonica_sig, amp_harmonica_sig);
-            lcd_escreve_linha(1, buffer);
+            snprintf(buffer, sizeof(buffer), "Max: %dHz %.1f%%", sig_harmonic_freq, sig_harmonic_amp);
+            lcd_write_line(1, buffer);
         }
 
-        // Determina a taxa de atualização natural (Taxa de *Refresh* Visível)
+        // Determines the natural refresh rate (Visible Refresh Rate)
         vTaskDelay(pdMS_TO_TICKS(500));  
         
-        // Devolve o controle de contexto para reiniciar um novo ciclo temporal
-        xSemaphoreGive(sem_inicio_ciclo);
+        // Returns context control to restart a new time cycle
+        xSemaphoreGive(sem_cycle_start);
     }
 }
 
 // ============================================================================
-// PONTO DE ENTRADA DO SISTEMA (Setup)
+// SYSTEM ENTRY POINT (Setup)
 // ============================================================================
 void app_main(void)
 {
-    // Desativado preventivamente para não acionar resets de tempo de guarda
+    // Preventively deactivated so as not to trigger guard time resets
     esp_task_wdt_deinit();
 
-    // Inicialização do Hardware
-    configura_leds();
-    configura_adc();
-    configura_timer();
-    configura_i2c_lcd();
-    configura_botao();
+    // Hardware Initialization
+    config_leds();
+    config_adc();
+    config_timer();
+    config_i2c_lcd();
+    config_button();
 
-    // Alocação Primitiva RTOS: Máquina de estados baseada em Semáforos
-    sem_processamento = xSemaphoreCreateBinary();
-    sem_exibicao      = xSemaphoreCreateBinary();
-    sem_inicio_ciclo  = xSemaphoreCreateBinary();
+    // Primitive RTOS Allocation: Semaphore-based state machine
+    sem_processing  = xSemaphoreCreateBinary();
+    sem_display     = xSemaphoreCreateBinary();
+    sem_cycle_start = xSemaphoreCreateBinary();
 
-    // Despacho das Tarefas ao Escalonador (Atribuição explícita de Prioridades)
-    xTaskCreate(vTarefaAmostragem,   "Amostragem",    4096, NULL, tskIDLE_PRIORITY + 3, &handle_amostragem);
-    // Prioridade e Stack elevadas em decorrência das exigências da FFT (Alocação, Math.h)
-    xTaskCreate(vTarefaProcessamento,"Processamento", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
-    xTaskCreate(vTarefaExibicao,     "Exibicao",      4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+    // Dispatching Tasks to the Scheduler (Explicit Priority Assignment)
+    xTaskCreate(vSamplingTask,   "Sampling",   4096, NULL, tskIDLE_PRIORITY + 3, &sampling_handle);
+    // Elevated Priority and Stack due to FFT demands (Allocation, Math.h)
+    xTaskCreate(vProcessingTask, "Processing", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
+    xTaskCreate(vDisplayTask,    "Display",    4096, NULL, tskIDLE_PRIORITY + 1, NULL);
 }
